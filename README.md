@@ -1,4 +1,6 @@
 # Telegram Blackjack Bot
+cat > README.md << 'EOF'
+# Telegram Blackjack Bot
 
 A multiplayer blackjack bot for Telegram with tournament mode.
 
