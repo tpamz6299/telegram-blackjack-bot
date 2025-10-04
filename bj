@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+
+import random
+import logging
+import asyncio
+import os
+import time
+import signal
+import sys
+from datetime import datetime, timedelta
+from typing import Dict, Optional
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Optimized logging - only show errors
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.ERROR
+)
+logger = logging.getLogger(__name__)
+
+# Global flag to track if we're shutting down
+is_shutting_down = False
+
+# Card deck
+SUITS = ['♠', '♥', '♦', '♣']
+RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
+
+class Card:
+    __slots__ = ('suit', 'rank')
+    
+    def __init__(self, suit, rank):
+        self.suit = suit
+        self.rank = rank
+    
+    def __str__(self):
+        return f"{self.rank}{self.suit}"
+    
+    def value(self):
+        if self.rank in ['J', 'Q', 'K']:
+            return 10
+        elif self.rank == 'A':
+            return 11
+        else:
+            return int(self.rank)
+
+class Deck:
+    __slots__ = ('cards',)
+    
+    def __init__(self):
+        self.cards = [Card(suit, rank) for suit in SUITS for rank in RANKS]
+        self.shuffle()
+    
+    def shuffle(self):
+        random.shuffle(self.cards)
+    
+    def deal(self):
+        if len(self.cards) < 10:
+            self.__init__()
+        return self.cards.pop()
+
+class MultiplayerBlackjackGame:
+    __slots__ = (
+        'group_id', 'players', 'dealer_hand', 'deck', 'game_state', 
+        'creator_id', 'message_id', 'created_time', 'last_activity', 
+        'turn_start_time', 'round_number', 'game_mode', '_active_players_cache',
+        '_display_cache', '_cache_time', '_player_list_cache'
+    )
+    
+    def __init__(self, group_id, creator_id, creator_name):
+        self.group_id = group_id
+        self.players = {}
+        self.dealer_hand = []
+        self.deck = Deck()
+        self.game_state = 'waiting'
+        self.creator_id = creator_id
+        self.message_id = None
+        self.created_time = datetime.now()
+        self.last_activity = datetime.now()
+        self.turn_start_time = None
+        self.round_number = 1
+        self.game_mode = 'waiting'
+        
+        # Caching for performance
+        self._active_players_cache = None
+        self._display_cache = None
+        self._cache_time = None
+        self._player_list_cache = None
+        
+        self.add_player(creator_id, creator_name)
+    
+    def update_activity(self):
+        self.last_activity = datetime.now()
+        self._display_cache = None
+    
+    def add_player(self, user_id, user_name):
+        if user_id not in self.players:
+            self.players[user_id] = {
+                'name': user_name,
+                'hand': [],
+                'status': 'waiting',
+                'decision': 'pending',
+                'game_score': 0,
+                'total_score': 0,
+                'eliminated': False,
+                'rounds_survived': 0
+            }
+            self.update_activity()
+            self._active_players_cache = None
+            self._player_list_cache = None
+            return True
+        return False
+    
+    def get_active_players(self):
+        if self._active_players_cache is None:
+            self._active_players_cache = [p for p in self.players.values() if not p['eliminated']]
+        return self._active_players_cache
+    
+    def get_player_list_text(self):
+        if self._player_list_cache is None:
+            lines = []
+            for player in self.players.values():
+                line = f"• {player['name']}"
+                if player['total_score'] != 0:
+                    line += f" ({player['total_score']})"
+                lines.append(line)
+            self._player_list_cache = "\n".join(lines)
+        return self._player_list_cache
+    
+    def start_game(self):
+        if len(self.players) < 1:
+            return False
+        
+        self.game_mode = 'solo' if len(self.players) == 1 else 'tournament'
+        self.game_state = 'in_progress'
+        self.deck = Deck()
+        self.dealer_hand = []
+        self.round_number = 1
+        
+        for player_id in self.players:
+            player = self.players[player_id]
+            player.update({
+                'hand': [self.deck.deal(), self.deck.deal()],
+                'status': 'playing',
+                'decision': 'pending',
+                'game_score': 0,
+                'eliminated': False,
+                'rounds_survived': 0
+            })
+        
+        self.dealer_hand = [self.deck.deal(), self.deck.deal()]
+        self.turn_start_time = datetime.now()
+        self._active_players_cache = None
+        self._display_cache = None
+        self._player_list_cache = None
+        self.update_activity()
+        
+        return True
+    
+    def calculate_hand_value(self, hand):
+        value = 0
+        aces = 0
+        
+        for card in hand:
+            card_val = card.value()
+            value += card_val
+            if card_val == 11:
+                aces += 1
+        
+        while value > 21 and aces > 0:
+            value -= 10
+            aces -= 1
+        
+        return value
+    
+    def player_hit(self, user_id):
+        if user_id not in self.players:
+            return "not_found"
+            
+        player = self.players[user_id]
+        if player['decision'] != 'pending':
+            return "not_active"
+        
+        player['hand'].append(self.deck.deal())
+        player['decision'] = 'hit'
+        
+        player_value = self.calculate_hand_value(player['hand'])
+        
+        if player_value > 21:
+            player['status'] = 'busted'
+            player['decision'] = 'bust'
+            if self.game_mode == 'tournament':
+                player['eliminated'] = True
+                self._active_players_cache = None
+        
+        self._display_cache = None
+        self.update_activity()
+        return "success"
+    
+    def player_stand(self, user_id):
+        if user_id not in self.players:
+            return "not_found"
+            
+        player = self.players[user_id]
+        if player['decision'] != 'pending':
+            return "not_active"
+        
+        player['decision'] = 'stand'
+        player['status'] = 'stood'
+        self._display_cache = None
+        self.update_activity()
+        return "success"
+    
+    def auto_stand_player(self, user_id):
+        if user_id in self.players and self.players[user_id]['decision'] == 'pending':
+            self.players[user_id]['decision'] = 'auto_stand'
+            self.players[user_id]['status'] = 'stood'
+            self._display_cache = None
+    
+    def check_turn_complete(self):
+        for player in self.players.values():
+            if player['status'] == 'playing' and player['decision'] == 'pending':
+                return False
+        return True
+    
+    def process_turn_results(self):
+        for player in self.players.values():
+            if player['decision'] == 'hit':
+                player_value = self.calculate_hand_value(player['hand'])
+                if player_value <= 21:
+                    player['decision'] = 'pending'
+                    player['status'] = 'playing'
+        
+        if self.check_turn_complete():
+            self.next_turn()
+    
+    def next_turn(self):
+        playing_players = [p for p in self.players.values() if p['status'] == 'playing' and p['decision'] == 'pending']
+        
+        if not playing_players:
+            self.process_round_results()
+        
+        self.update_activity()
+    
+    def process_round_results(self):
+        if self.game_mode == 'solo':
+            self.dealer_play()
+            self.calculate_solo_results()
+            self.game_state = 'finished'
+        else:
+            self.calculate_tournament_results()
+            self.round_number += 1
+            
+            active_players = self.get_active_players()
+            if len(active_players) <= 1:
+                self.game_state = 'finished'
+                self.calculate_tournament_winner()
+            else:
+                self.start_new_round()
+        
+        self._display_cache = None
+    
+    def start_new_round(self):
+        self.deck = Deck()
+        self.dealer_hand = [self.deck.deal(), self.deck.deal()]
+        
+        for player in self.players.values():
+            if not player['eliminated']:
+                player.update({
+                    'hand': [self.deck.deal(), self.deck.deal()],
+                    'status': 'playing',
+                    'decision': 'pending',
+                    'game_score': 0
+                })
+                player['rounds_survived'] += 1
+        
+        self.turn_start_time = datetime.now()
+        self._active_players_cache = None
+        self._display_cache = None
+    
+    def calculate_solo_results(self):
+        dealer_value = self.calculate_hand_value(self.dealer_hand)
+        
+        for player in self.players.values():
+            player_value = self.calculate_hand_value(player['hand'])
+            
+            if player['status'] == 'busted':
+                player['result'] = 'bust'
+                player['game_score'] = -1
+            elif dealer_value > 21:
+                player['result'] = 'dealer_bust'
+                player['game_score'] = 1
+            elif player_value > dealer_value:
+                player['result'] = 'win'
+                player['game_score'] = 1
+            elif player_value < dealer_value:
+                player['result'] = 'lose'
+                player['game_score'] = -1
+            else:
+                player['result'] = 'push'
+                player['game_score'] = 0
+            
+            player['total_score'] += player['game_score']
+    
+    def calculate_tournament_results(self):
+        best_value = 0
+        for player in self.get_active_players():
+            if player['status'] != 'busted':
+                player_value = self.calculate_hand_value(player['hand'])
+                if player_value <= 21 and player_value > best_value:
+                    best_value = player_value
+        
+        for player in self.players.values():
+            if not player['eliminated']:
+                player_value = self.calculate_hand_value(player['hand'])
+                
+                if player['status'] == 'busted':
+                    player['result'] = 'bust'
+                    player['eliminated'] = True
+                    player['game_score'] = -1
+                elif player_value < best_value:
+                    player['result'] = 'eliminated'
+                    player['eliminated'] = True
+                    player['game_score'] = -1
+                elif player_value == best_value:
+                    player['result'] = 'survive'
+                    player['game_score'] = 1
+                else:
+                    player['result'] = 'survive'
+                    player['game_score'] = 1
+                
+                player['total_score'] += player['game_score']
+        
+        self._active_players_cache = None
+    
+    def calculate_tournament_winner(self):
+        remaining_players = self.get_active_players()
+        if remaining_players:
+            winner = remaining_players[0]
+            winner['result'] = 'tournament_win'
+            winner['game_score'] = 5
+            winner['total_score'] += winner['game_score']
+    
+    def dealer_play(self):
+        dealer_value = self.calculate_hand_value(self.dealer_hand)
+        while dealer_value < 17:
+            self.dealer_hand.append(self.deck.deal())
+            dealer_value = self.calculate_hand_value(self.dealer_hand)
+    
+    def get_time_remaining(self):
+        if not self.turn_start_time:
+            return 0
+        elapsed = (datetime.now() - self.turn_start_time).total_seconds()
+        return max(0, 20 - elapsed)
+    
+    def get_game_display(self):
+        # Cache for 2 seconds during rapid timer updates
+        current_time = datetime.now()
+        if (self._display_cache and self._cache_time and 
+            (current_time - self._cache_time).total_seconds() < 2.0):
+            return self._display_cache
+        
+        text = "🎮 **Blackjack** 🎮\n\n"
+        
+        if self.game_state == 'waiting':
+            text += "🕐 **Waiting for players...**\n"
+            text += f"👥 **Players:** {len(self.players)}\n"
+            text += self.get_player_list_text()
+            
+            mode = "Solo vs Dealer" if len(self.players) == 1 else "Tournament (Knockout)"
+            text += f"\n\n🎯 **Mode:** {mode}\n"
+            text += "➕ **Join to play!**"
+            
+        elif self.game_state == 'in_progress':
+            time_remaining = int(self.get_time_remaining())
+            progress_bar = self.get_progress_bar(time_remaining)
+            
+            if self.game_mode == 'solo':
+                text += f"🎯 **Solo Game** - {time_remaining}s left\n"
+            else:
+                active_count = len(self.get_active_players())
+                text += f"🏆 **Round {self.round_number}** - {time_remaining}s left\n"
+                text += f"👥 **Players left:** {active_count}/{len(self.players)}\n"
+            
+            text += f"`{progress_bar}`\n\n"
+            
+            if self.game_mode == 'solo':
+                text += f"💼 **Dealer:** {self.dealer_hand[0]} ❓\n\n"
+            
+            players_to_show = self.players.values() if self.game_mode == 'solo' else self.get_active_players()
+            
+            for player in players_to_show:
+                if self.game_mode == 'tournament' and player['eliminated']:
+                    continue
+                
+                status_emoji = {'waiting': '⏳', 'playing': '🎲', 'stood': '✋', 'busted': '💥'}.get(player['status'], '❓')
+                decision_emoji = {'pending': '🤔', 'hit': '🃏', 'stand': '✋', 'auto_stand': '⏰', 'bust': '💥'}.get(player['decision'], '❓')
+                eliminated_emoji = '💀' if player['eliminated'] else ''
+                
+                hand_str = ' '.join(str(card) for card in player['hand'])
+                hand_value = self.calculate_hand_value(player['hand'])
+                
+                text += f"{status_emoji}{decision_emoji}{eliminated_emoji} **{player['name']}:** {hand_str} ({hand_value})\n"
+                
+                if player['decision'] == 'pending':
+                    text += "   🤔 **Deciding...**\n"
+                elif player['decision'] == 'hit':
+                    text += "   🃏 **Hit**\n"
+                elif player['decision'] == 'stand':
+                    text += "   ✋ **Stand**\n"
+                elif player['decision'] == 'auto_stand':
+                    text += "   ⏰ **Auto-Stand**\n"
+                elif player['status'] == 'busted':
+                    text += "   💥 **Busted!**\n"
+                
+                if player['eliminated']:
+                    text += "   💀 **ELIMINATED!**\n"
+                
+                text += "\n"
+            
+        elif self.game_state == 'finished':
+            if self.game_mode == 'solo':
+                text += "🏁 **Game Finished!** 🏁\n\n"
+                dealer_value = self.calculate_hand_value(self.dealer_hand)
+                dealer_cards = ' '.join(str(card) for card in self.dealer_hand)
+                text += f"💼 **Dealer:** {dealer_cards} ({dealer_value})"
+                if dealer_value > 21:
+                    text += " 💥"
+                text += "\n\n"
+                
+                for player in self.players.values():
+                    player_value = self.calculate_hand_value(player['hand'])
+                    result_emoji = {'win': '🎉', 'lose': '😞', 'push': '🤝', 'bust': '💥', 'dealer_bust': '🎉'}.get(player['result'], '❓')
+                    player_cards = ' '.join(str(card) for card in player['hand'])
+                    
+                    text += f"{result_emoji} **{player['name']}:** {player_cards} ({player_value}) - "
+                    
+                    if player['result'] == 'win':
+                        text += "WIN! 🎉"
+                    elif player['result'] == 'lose':
+                        text += "Lose"
+                    elif player['result'] == 'push':
+                        text += "Push"
+                    elif player['result'] == 'bust':
+                        text += "Bust! 💥"
+                    elif player['result'] == 'dealer_bust':
+                        text += "Dealer Bust! 🎉"
+                    
+                    score_change = "+1" if player['game_score'] > 0 else "-1" if player['game_score'] < 0 else "0"
+                    text += f" {score_change} | Total: {player['total_score']}\n"
+                    
+            else:
+                text += "🏆 **Tournament Finished!** 🏆\n\n"
+                players_sorted = sorted(
+                    self.players.values(), 
+                    key=lambda x: (not x['eliminated'], x['rounds_survived'], x['total_score']), 
+                    reverse=True
+                )
+                
+                for i, player in enumerate(players_sorted):
+                    if i == 0 and not player['eliminated']:
+                        text += f"🥇 **{player['name']}** - CHAMPION! 🏆\n"
+                        text += f"   Rounds survived: {player['rounds_survived']} | Score: {player['total_score']}\n\n"
+                    else:
+                        medal = "💀" if player['eliminated'] else f"{i+1}."
+                        text += f"{medal} **{player['name']}**\n"
+                        text += f"   Rounds survived: {player['rounds_survived']} | Score: {player['total_score']}\n"
+        
+        self._display_cache = text
+        self._cache_time = current_time
+        return text
+
+    def get_progress_bar(self, time_remaining):
+        filled = int((time_remaining / 20) * 10)
+        return '█' * filled + '░' * (10 - filled)
+
+    def get_control_buttons(self):
+        if self.game_state == 'waiting':
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Join Game", callback_data="join")],
+                [InlineKeyboardButton("🚀 Start Game", callback_data="start_game")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+            ])
+        elif self.game_state == 'in_progress':
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton("🃏 Hit", callback_data="hit"),
+                 InlineKeyboardButton("✋ Stand", callback_data="stand")],
+                [InlineKeyboardButton("🔄 Refresh", callback_data="status")]
+            ])
+        else:
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Play Again", callback_data="rematch"),
+                 InlineKeyboardButton("❌ End Game", callback_data="cancel")],
+                [InlineKeyboardButton("📈 Leaderboard", callback_data="leaderboard")]
+            ])
+    
+    def is_inactive(self, hours=2):
+        return datetime.now() - self.last_activity > timedelta(hours=hours)
+
+
+# Store active games
+active_games: Dict[int, MultiplayerBlackjackGame] = {}
+# Track update timing with cooldowns
+last_updates: Dict[int, float] = {}
+update_lock = asyncio.Lock()
+
+async def safe_edit_message(chat_id: int, message_id: int, text: str, reply_markup, context: ContextTypes.DEFAULT_TYPE):
+    """Safely edit message with timeout protection"""
+    global is_shutting_down
+    
+    if is_shutting_down:
+        return False
+        
+    try:
+        # Use timeout to prevent hanging
+        await asyncio.wait_for(
+            context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            ),
+            timeout=10.0  # 10 second timeout
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout editing message in chat {chat_id}")
+        return False
+    except Exception as e:
+        # Don't log "message not modified" errors
+        if "Message is not modified" not in str(e) and "Message to edit not found" not in str(e):
+            logger.error(f"Error editing message: {e}")
+        return False
+
+async def update_game_display(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Optimized game display update with aggressive rate limiting"""
+    global is_shutting_down
+    
+    if is_shutting_down or chat_id not in active_games:
+        return
+    
+    current_time = time.time()
+    
+    # Aggressive rate limiting: only update once per second during timer
+    if chat_id in last_updates and (current_time - last_updates[chat_id]) < 1.0:
+        return
+    
+    async with update_lock:
+        game = active_games[chat_id]
+        last_updates[chat_id] = current_time
+        
+        success = await safe_edit_message(
+            chat_id, 
+            game.message_id, 
+            game.get_game_display(), 
+            game.get_control_buttons(), 
+            context
+        )
+        
+        if not success:
+            # If update failed, extend the cooldown
+            last_updates[chat_id] = current_time + 2.0
+
+async def turn_timer_with_updates(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Optimized timer with minimal updates"""
+    global is_shutting_down
+    
+    try:
+        if is_shutting_down or chat_id not in active_games:
+            return
+        
+        game = active_games[chat_id]
+        
+        # Strategic update points - fewer updates overall
+        update_points = [0, 5, 10, 15, 19]  # Only update 5 times instead of 20
+        
+        for second in range(20):
+            if is_shutting_down or chat_id not in active_games or game.game_state != 'in_progress':
+                return
+            
+            if second in update_points:
+                await update_game_display(chat_id, context)
+            
+            await asyncio.sleep(1)
+        
+        # Final check before processing turn
+        if is_shutting_down or chat_id not in active_games or game.game_state != 'in_progress':
+            return
+        
+        # Auto-stand for pending players
+        for player_id, player in game.players.items():
+            if (player['status'] == 'playing' and 
+                player['decision'] == 'pending' and
+                not player['eliminated']):
+                game.auto_stand_player(player_id)
+        
+        game.process_turn_results()
+        await update_game_display(chat_id, context)
+        
+        # Continue if game still in progress
+        if not is_shutting_down and chat_id in active_games and game.game_state == 'in_progress':
+            asyncio.create_task(turn_timer_with_updates(chat_id, context))
+            
+    except Exception as e:
+        logger.error(f"Timer error: {e}")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send help message."""
+    help_text = """
+🎮 **Blackjack Bot** 🎮
+
+**Commands:**
+/blackjack - Start a game
+/rules - Show rules  
+/score - Show scores
+
+**Game Modes:**
+• **Solo** (1 player): Play vs dealer
+• **Tournament** (2+ players): Knockout competition!
+
+**Features:**
+- 🕐 Simultaneous turns
+- ⏰ 20-second timer
+- 🏆 Tournament knockout
+- 👥 Unlimited players
+
+Have fun! 🃏
+    """
+    await update.message.reply_text(help_text)
+
+async def blackjack_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start a new multiplayer blackjack game."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    
+    if chat_id in active_games:
+        game = active_games[chat_id]
+        await update.message.reply_text(
+            game.get_game_display(),
+            reply_markup=game.get_control_buttons(),
+            parse_mode='Markdown'
+        )
+        return
+    
+    game = MultiplayerBlackjackGame(chat_id, user.id, user.first_name)
+    active_games[chat_id] = game
+    
+    message = await update.message.reply_text(
+        game.get_game_display(),
+        reply_markup=game.get_control_buttons(),
+        parse_mode='Markdown'
+    )
+    
+    game.message_id = message.message_id
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle button callbacks with timeout protection"""
+    query = update.callback_query
+    await query.answer()  # Answer immediately
+    
+    user = query.from_user
+    chat_id = query.message.chat_id
+    action = query.data
+    
+    try:
+        if chat_id not in active_games:
+            await query.edit_message_text("❌ No active game. Use /blackjack")
+            return
+        
+        game = active_games[chat_id]
+        game.update_activity()
+        
+        if action == "join":
+            if game.add_player(user.id, user.first_name):
+                await update_game_display(chat_id, context)
+            else:
+                await query.answer("Already joined!", show_alert=True)
+                
+        elif action == "start_game":
+            if user.id == game.creator_id and game.game_state == 'waiting':
+                if len(game.players) >= 1:
+                    game.start_game()
+                    await update_game_display(chat_id, context)
+                    asyncio.create_task(turn_timer_with_updates(chat_id, context))
+                else:
+                    await query.answer("Need at least 1 player!", show_alert=True)
+            else:
+                await query.answer("Only game creator can start!", show_alert=True)
+                
+        elif action in ["hit", "stand"]:
+            if user.id not in game.players:
+                await query.answer("You're not in this game!", show_alert=True)
+                return
+                
+            player = game.players[user.id]
+            if player['eliminated']:
+                await query.answer("You're eliminated!", show_alert=True)
+                return
+                
+            if player['decision'] != 'pending':
+                await query.answer("Already decided this turn!", show_alert=True)
+                return
+            
+            if action == "hit":
+                result = game.player_hit(user.id)
+            else:
+                result = game.player_stand(user.id)
+            
+            if result == "success":
+                await update_game_display(chat_id, context)
+                game.process_turn_results()
+                if game.game_state == 'in_progress':
+                    await update_game_display(chat_id, context)
+        
+        elif action == "status":
+            await update_game_display(chat_id, context)
+            
+        elif action == "rematch":
+            if user.id == game.creator_id and game.game_state == 'finished':
+                if game.start_game():
+                    await update_game_display(chat_id, context)
+                    asyncio.create_task(turn_timer_with_updates(chat_id, context))
+                else:
+                    await query.answer("Error starting new game!", show_alert=True)
+            else:
+                await query.answer("Only creator can rematch!", show_alert=True)
+                
+        elif action == "leaderboard":
+            players_sorted = sorted(game.players.values(), key=lambda x: x['total_score'], reverse=True)
+            leaderboard = "📈 **Leaderboard:**\n" + "\n".join(
+                f"{i+1}. {p['name']}: {p['total_score']}" 
+                for i, p in enumerate(players_sorted[:5])
+            )
+            await query.answer(leaderboard, show_alert=True)
+            
+        elif action == "cancel":
+            if user.id == game.creator_id:
+                del active_games[chat_id]
+                await query.edit_message_text("❌ Game cancelled by creator")
+            else:
+                await query.answer("Only creator can cancel!", show_alert=True)
+    
+    except Exception as e:
+        logger.error(f"Button error: {e}")
+        await query.answer("Error processing action!", show_alert=True)
+
+async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show Blackjack rules."""
+    rules_text = """
+🎯 **Blackjack Rules:**
+
+**Goal:** Get closer to 21 than dealer without busting.
+
+**Card Values:**
+- 2-10 = Face value
+- J, Q, K = 10  
+- A = 1 or 11
+
+**Game Modes:**
+🎯 **Solo:** Play against dealer
+🏆 **Tournament:** Knockout! Lowest hands eliminated each round
+
+**Flow:**
+1. Join with /blackjack
+2. Everyone plays at once
+3. 20-second timer per decision
+4. Auto-stand if no decision
+5. Tournament: Continue until one player remains
+
+**Good luck!** 🍀
+    """
+    await update.message.reply_text(rules_text, parse_mode='Markdown')
+
+async def score_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current game scores."""
+    chat_id = update.effective_chat.id
+    
+    if chat_id in active_games:
+        game = active_games[chat_id]
+        await update.message.reply_text(
+            game.get_game_display(),
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("No active game. Use /blackjack to start one!")
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors gracefully."""
+    logger.error(f"Bot error: {context.error}")
+    
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text("❌ An error occurred. Please try again.")
+    except Exception as e:
+        logger.error(f"Error in error handler: {e}")
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    global is_shutting_down
+    print(f"\n🛑 Received signal {signum}, shutting down gracefully...")
+    is_shutting_down = True
+    sys.exit(0)
+
+def main():
+    """Start the bot with proper shutdown handling."""
+    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    
+    if not TOKEN:
+        print("❌ ERROR: Set TELEGRAM_BOT_TOKEN in .env file!")
+        return
+    
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    print("🎮 Starting ULTRA-OPTIMIZED Blackjack Bot...")
+    print("⚡ Features: Timeout protection, aggressive rate limiting, minimal updates")
+    
+    # Create application
+    application = Application.builder().token(TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("blackjack", blackjack_command))
+    application.add_handler(CommandHandler("rules", rules_command))
+    application.add_handler(CommandHandler("score", score_command))
+    application.add_handler(CommandHandler("help", start))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    print("🤖 Bot is running smoothly...")
+    print("💡 Optimizations: 1-second rate limiting, 5 updates per turn, timeout protection")
+    print("🛑 Press Ctrl+C to stop the bot")
+    
+    try:
+        application.run_polling()
+    except KeyboardInterrupt:
+        print("🛑 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Bot crashed: {e}")
+
+if __name__ == '__main__':
+    main()
